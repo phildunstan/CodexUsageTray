@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -41,11 +42,18 @@ int g_remaining = 0;
 bool g_hasPercentage = false;
 bool g_apiAvailable = false;
 bool g_active = false;
+int g_expectedRemaining = -1;
 UINT g_taskbarCreated = 0;
+
+struct UsageSnapshot {
+    int remaining = 0;
+    int expectedRemaining = -1;
+};
 
 struct UpdateResult {
     bool usageOk = false;
     int remaining = 0;
+    int expectedRemaining = -1;
     bool active = false;
 };
 
@@ -183,28 +191,39 @@ std::optional<std::string_view> ExtractObject(std::string_view json, std::string
     return std::nullopt;
 }
 
-std::optional<int> ParseWeeklyRemaining(std::string_view response) {
+std::optional<UsageSnapshot> ParseWeeklyRemaining(std::string_view response) {
     const auto result = ExtractObject(response, "\"result\"");
     if (!result) return std::nullopt;
     const auto limits = ExtractObject(*result, "\"rateLimits\"");
     if (!limits) return std::nullopt;
 
-    struct Window { long long minutes; long long used; };
+    struct Window { long long minutes; long long used; std::optional<long long> resetsAt; };
     std::vector<Window> windows;
     for (const std::string_view key : {std::string_view("\"primary\""), std::string_view("\"secondary\"")}) {
         const auto window = ExtractObject(*limits, key);
         if (!window) continue;
         const auto used = ExtractInteger(*window, "\"usedPercent\"");
         const auto minutes = ExtractInteger(*window, "\"windowDurationMins\"");
-        if (used && minutes) windows.push_back({*minutes, *used});
+        const auto resetsAt = ExtractInteger(*window, "\"resetsAt\"");
+        if (used && minutes) windows.push_back({*minutes, *used, resetsAt});
     }
     if (windows.empty()) return std::nullopt;
     const auto weekly = std::max_element(windows.begin(), windows.end(),
         [](const Window& left, const Window& right) { return left.minutes < right.minutes; });
-    return std::clamp(100 - static_cast<int>(weekly->used), 0, 100);
+    UsageSnapshot snapshot;
+    snapshot.remaining = std::clamp(100 - static_cast<int>(weekly->used), 0, 100);
+    if (weekly->resetsAt && weekly->minutes > 0) {
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const double secondsRemaining = static_cast<double>(*weekly->resetsAt - now);
+        const double windowSeconds = static_cast<double>(weekly->minutes * 60);
+        snapshot.expectedRemaining = std::clamp(
+            static_cast<int>(std::lround(secondsRemaining / windowSeconds * 100.0)), 0, 100);
+    }
+    return snapshot;
 }
 
-std::optional<int> QueryWeeklyRemaining() {
+std::optional<UsageSnapshot> QueryWeeklyRemaining() {
     SECURITY_ATTRIBUTES attributes{sizeof(attributes), nullptr, TRUE};
     HANDLE childOutReadRaw = nullptr, childOutWriteRaw = nullptr;
     HANDLE childInReadRaw = nullptr, childInWriteRaw = nullptr;
@@ -257,7 +276,7 @@ std::optional<int> QueryWeeklyRemaining() {
         return std::nullopt;
     }
 
-    std::optional<int> remaining;
+    std::optional<UsageSnapshot> remaining;
     while (ReadUtf8Line(childOutRead.get(), process.get(), pending, line, deadline)) {
         if (line.find("\"id\":2") != std::string::npos) {
             remaining = ParseWeeklyRemaining(line);
@@ -322,7 +341,8 @@ bool AnyTaskActive() {
     return false;
 }
 
-HICON CreateStatusIcon(int remaining, bool hasPercentage, bool apiAvailable, bool active) {
+HICON CreateStatusIcon(int remaining, int expectedRemaining, bool hasPercentage,
+                       bool apiAvailable, bool active) {
     // Explorer renders notification icons at 16x16 logical pixels. Drawing a
     // larger anti-aliased label and letting Explorer shrink it makes the text
     // disappear, so both the ring and a tiny 3x5 pixel font are rendered at the
@@ -333,10 +353,11 @@ HICON CreateStatusIcon(int remaining, bool hasPercentage, bool apiAvailable, boo
     graphics.SetSmoothingMode(SmoothingModeAntiAlias);
     graphics.Clear(Color(0, 0, 0, 0));
 
-    Color accent(255, 142, 142, 142);
-    if (apiAvailable) {
-        if (remaining < 20) accent = Color(255, 232, 65, 65);
-        else if (active) accent = Color(255, 48, 139, 245);
+    Color accent = active
+        ? Color(255, 48, 139, 245)
+        : Color(255, 128, 203, 255);
+    if (apiAvailable && expectedRemaining >= 0 && remaining < expectedRemaining) {
+        accent = Color(255, 232, 65, 65);
     }
     const Color usedColor(255, 205, 205, 205);
     Pen usedPen(usedColor, 2.0f);
@@ -360,11 +381,15 @@ std::wstring TooltipText() {
     if (!g_hasPercentage) return L"Codex weekly usage unavailable";
     std::wstring text = L"Codex: " + std::to_wstring(g_remaining) + L"% weekly remaining";
     if (!g_apiAvailable) return text + L" (last known; API unavailable)";
+    if (g_expectedRemaining >= 0) {
+        text += L" (expected " + std::to_wstring(g_expectedRemaining) + L"%)";
+    }
     return text + (g_active ? L" - task active" : L" - idle / last task complete");
 }
 
 void AddOrUpdateTrayIcon(bool add) {
-    HICON replacement = CreateStatusIcon(g_remaining, g_hasPercentage, g_apiAvailable, g_active);
+    HICON replacement = CreateStatusIcon(g_remaining, g_expectedRemaining,
+        g_hasPercentage, g_apiAvailable, g_active);
     if (!replacement) return;
     NOTIFYICONDATAW data{};
     data.cbSize = sizeof(data);
@@ -392,9 +417,10 @@ void BeginRefresh() {
     if (!g_refreshRunning.compare_exchange_strong(expected, true)) return;
     const uintptr_t thread = _beginthreadex(nullptr, 0, [](void*) -> unsigned {
         auto result = std::make_unique<UpdateResult>();
-        if (const auto remaining = QueryWeeklyRemaining()) {
+        if (const auto usage = QueryWeeklyRemaining()) {
             result->usageOk = true;
-            result->remaining = *remaining;
+            result->remaining = usage->remaining;
+            result->expectedRemaining = usage->expectedRemaining;
         }
         result->active = AnyTaskActive();
         UpdateResult* raw = result.release();
@@ -442,6 +468,7 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         g_refreshRunning = false;
         g_active = result->active;
         g_apiAvailable = result->usageOk;
+        g_expectedRemaining = result->usageOk ? result->expectedRemaining : -1;
         if (result->usageOk) {
             const bool changed = !g_hasPercentage || g_remaining != result->remaining;
             g_remaining = result->remaining;
