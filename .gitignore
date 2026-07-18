@@ -1,0 +1,7 @@
+# Visual Studio build output
+/CodexUsageTray/
+/x64/
+/.vs/
+*.user
+*.pdb
+*.ilk
