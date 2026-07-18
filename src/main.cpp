@@ -357,7 +357,7 @@ HICON CreateStatusIcon(int remaining, int expectedRemaining, bool hasPercentage,
         ? Color(255, 48, 139, 245)
         : Color(255, 128, 203, 255);
     if (apiAvailable && expectedRemaining >= 0 && remaining < expectedRemaining) {
-        accent = Color(255, 232, 65, 65);
+        accent = Color(255, 168, 85, 247);
     }
     const Color usedColor(255, 205, 205, 205);
     Pen usedPen(usedColor, 2.0f);
