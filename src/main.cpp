@@ -252,7 +252,7 @@ std::optional<UsageSnapshot> QueryWeeklyRemaining() {
     childOutWrite.reset();
 
     std::string pending, line;
-    const auto deadline = std::chrono::steady_clock::now() + 15s;
+    const auto deadline = std::chrono::steady_clock::now() + 30s;
     const auto stopChild = [&] {
         childInWrite.reset();
         if (WaitForSingleObject(process.get(), 1000) == WAIT_TIMEOUT) {
@@ -287,7 +287,8 @@ std::optional<UsageSnapshot> QueryWeeklyRemaining() {
     return remaining;
 }
 
-bool HasRecentOpenTask(const fs::path& file) {
+bool HasRecentOpenTask(const fs::path& file,
+                       std::chrono::steady_clock::time_point deadline) {
     std::error_code error;
     const uintmax_t length = fs::file_size(file, error);
     if (error || !length) return false;
@@ -300,6 +301,7 @@ bool HasRecentOpenTask(const fs::path& file) {
     uintmax_t end = length;
     std::string later;
     while (end > 0) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
         const uintmax_t begin = end > chunkSize ? end - chunkSize : 0;
         const size_t count = static_cast<size_t>(end - begin);
         std::string block(count, '\0');
@@ -321,21 +323,22 @@ bool HasRecentOpenTask(const fs::path& file) {
     return false;
 }
 
-bool AnyTaskActive() {
+bool AnyTaskActive(std::chrono::steady_clock::time_point deadline) {
     const std::wstring profile = GetEnvironment(L"USERPROFILE");
     if (profile.empty()) return false;
     const fs::path sessions = fs::path(profile) / L".codex" / L"sessions";
     std::error_code error;
     if (!fs::exists(sessions, error)) return false;
 
-    const auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(24 * 7);
+    const auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(24 * 2);
     fs::recursive_directory_iterator iterator(sessions,
         fs::directory_options::skip_permission_denied, error), end;
     for (; iterator != end; iterator.increment(error)) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
         if (error) { error.clear(); continue; }
         if (!iterator->is_regular_file(error) || iterator->path().extension() != L".jsonl") continue;
         const auto modified = iterator->last_write_time(error);
-        if (!error && modified >= cutoff && HasRecentOpenTask(iterator->path())) return true;
+        if (!error && modified >= cutoff && HasRecentOpenTask(iterator->path(), deadline)) return true;
         error.clear();
     }
     return false;
@@ -409,7 +412,26 @@ void AddOrUpdateTrayIcon(bool add) {
 }
 
 void OpenCodex() {
-    ShellExecuteW(nullptr, L"open", L"codex.exe", L"app", nullptr, SW_SHOWNORMAL);
+    // ShellExecute does not reliably resolve bare executable names through the
+    // user's PATH or WindowsApps aliases. Activate the installed Codex package
+    // directly, then fall back to the CLI launcher if package activation is not
+    // available.
+    const HINSTANCE activation = ShellExecuteW(nullptr, L"open",
+        L"shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App",
+        nullptr, nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(activation) > 32) return;
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION process{};
+    std::wstring command = L"codex.exe app";
+    if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+            CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
 }
 
 void BeginRefresh() {
@@ -417,12 +439,17 @@ void BeginRefresh() {
     if (!g_refreshRunning.compare_exchange_strong(expected, true)) return;
     const uintptr_t thread = _beginthreadex(nullptr, 0, [](void*) -> unsigned {
         auto result = std::make_unique<UpdateResult>();
-        if (const auto usage = QueryWeeklyRemaining()) {
+        auto usage = QueryWeeklyRemaining();
+        if (!usage) {
+            Sleep(250);
+            usage = QueryWeeklyRemaining();
+        }
+        if (usage) {
             result->usageOk = true;
             result->remaining = usage->remaining;
             result->expectedRemaining = usage->expectedRemaining;
         }
-        result->active = AnyTaskActive();
+        result->active = AnyTaskActive(std::chrono::steady_clock::now() + 3s);
         UpdateResult* raw = result.release();
         if (!PostMessageW(g_window, kUpdateReady, 0, reinterpret_cast<LPARAM>(raw))) delete raw;
         return 0;
@@ -470,10 +497,11 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         g_apiAvailable = result->usageOk;
         g_expectedRemaining = result->usageOk ? result->expectedRemaining : -1;
         if (result->usageOk) {
-            const bool changed = !g_hasPercentage || g_remaining != result->remaining;
             g_remaining = result->remaining;
             g_hasPercentage = true;
-            if (changed) SaveLastPercentage(g_remaining);
+            // Refresh the file timestamp as a lightweight success heartbeat,
+            // even when the percentage itself has not changed.
+            SaveLastPercentage(g_remaining);
         }
         AddOrUpdateTrayIcon(false);
         return 0;
