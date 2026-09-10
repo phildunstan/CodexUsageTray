@@ -34,6 +34,25 @@ constexpr UINT kMenuExit = 1003;
 constexpr wchar_t kWindowClass[] = L"CodexUsageTrayMessageWindow";
 constexpr wchar_t kRunValue[] = L"CodexUsageTray";
 
+struct UsageWindow {
+    long long minutes = 0;
+    int remaining = 0;
+    int expectedRemaining = -1;
+};
+
+struct UsageSnapshot {
+    UsageWindow weekly;
+    std::optional<UsageWindow> shortWindow;
+};
+
+struct UpdateResult {
+    bool usageOk = false;
+    int remaining = 0;
+    int expectedRemaining = -1;
+    std::optional<UsageWindow> shortWindow;
+    bool active = false;
+};
+
 HWND g_window = nullptr;
 HICON g_icon = nullptr;
 ULONG_PTR g_gdiplusToken = 0;
@@ -43,19 +62,8 @@ bool g_hasPercentage = false;
 bool g_apiAvailable = false;
 bool g_active = false;
 int g_expectedRemaining = -1;
+std::optional<UsageWindow> g_shortWindow;
 UINT g_taskbarCreated = 0;
-
-struct UsageSnapshot {
-    int remaining = 0;
-    int expectedRemaining = -1;
-};
-
-struct UpdateResult {
-    bool usageOk = false;
-    int remaining = 0;
-    int expectedRemaining = -1;
-    bool active = false;
-};
 
 struct HandleCloser {
     void operator()(void* value) const noexcept {
@@ -72,6 +80,22 @@ std::wstring GetEnvironment(const wchar_t* name) {
     if (!written) return {};
     value.resize(written);
     return value;
+}
+
+std::wstring CodexExecutable() {
+    if (const std::wstring configured = GetEnvironment(L"CODEX_CLI_PATH");
+        !configured.empty()) {
+        return configured;
+    }
+
+    std::vector<wchar_t> buffer(MAX_PATH);
+    for (;;) {
+        const DWORD length = SearchPathW(nullptr, L"codex.exe", nullptr,
+            static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
+        if (!length) return L"codex.exe";
+        if (length < buffer.size()) return std::wstring(buffer.data(), length);
+        buffer.resize(length + 1);
+    }
 }
 
 fs::path StateFile() {
@@ -171,8 +195,16 @@ std::optional<long long> ExtractInteger(std::string_view object, std::string_vie
 std::optional<std::string_view> ExtractObject(std::string_view json, std::string_view key) {
     const size_t keyPosition = json.find(key);
     if (keyPosition == std::string_view::npos) return std::nullopt;
-    const size_t start = json.find('{', keyPosition + key.size());
-    if (start == std::string_view::npos) return std::nullopt;
+    size_t valuePosition = json.find(':', keyPosition + key.size());
+    if (valuePosition == std::string_view::npos) return std::nullopt;
+    ++valuePosition;
+    while (valuePosition < json.size() &&
+           (json[valuePosition] == ' ' || json[valuePosition] == '\t' ||
+            json[valuePosition] == '\r' || json[valuePosition] == '\n')) {
+        ++valuePosition;
+    }
+    if (valuePosition >= json.size() || json[valuePosition] != '{') return std::nullopt;
+    const size_t start = valuePosition;
     int depth = 0;
     bool inString = false;
     bool escaped = false;
@@ -191,34 +223,76 @@ std::optional<std::string_view> ExtractObject(std::string_view json, std::string
     return std::nullopt;
 }
 
-std::optional<UsageSnapshot> ParseWeeklyRemaining(std::string_view response) {
-    const auto result = ExtractObject(response, "\"result\"");
-    if (!result) return std::nullopt;
-    const auto limits = ExtractObject(*result, "\"rateLimits\"");
-    if (!limits) return std::nullopt;
+struct ParsedWindow {
+    long long minutes = 0;
+    long long used = 0;
+    std::optional<long long> resetsAt;
+};
 
-    struct Window { long long minutes; long long used; std::optional<long long> resetsAt; };
-    std::vector<Window> windows;
-    for (const std::string_view key : {std::string_view("\"primary\""), std::string_view("\"secondary\"")}) {
-        const auto window = ExtractObject(*limits, key);
+std::vector<ParsedWindow> ParseRateLimitWindows(std::string_view limits) {
+    std::vector<ParsedWindow> windows;
+    for (const std::string_view key : {std::string_view("\"primary\""),
+                                       std::string_view("\"secondary\"")}) {
+        const auto window = ExtractObject(limits, key);
         if (!window) continue;
         const auto used = ExtractInteger(*window, "\"usedPercent\"");
         const auto minutes = ExtractInteger(*window, "\"windowDurationMins\"");
         const auto resetsAt = ExtractInteger(*window, "\"resetsAt\"");
-        if (used && minutes) windows.push_back({*minutes, *used, resetsAt});
+        if (used && minutes && *minutes > 0) {
+            windows.push_back({*minutes, *used, resetsAt});
+        }
     }
-    if (windows.empty()) return std::nullopt;
-    const auto weekly = std::max_element(windows.begin(), windows.end(),
-        [](const Window& left, const Window& right) { return left.minutes < right.minutes; });
-    UsageSnapshot snapshot;
-    snapshot.remaining = std::clamp(100 - static_cast<int>(weekly->used), 0, 100);
-    if (weekly->resetsAt && weekly->minutes > 0) {
+    return windows;
+}
+
+UsageWindow MakeUsageWindow(const ParsedWindow& window) {
+    UsageWindow result;
+    result.minutes = window.minutes;
+    result.remaining = std::clamp(100 - static_cast<int>(window.used), 0, 100);
+    if (window.resetsAt && window.minutes > 0) {
         const auto now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-        const double secondsRemaining = static_cast<double>(*weekly->resetsAt - now);
-        const double windowSeconds = static_cast<double>(weekly->minutes * 60);
-        snapshot.expectedRemaining = std::clamp(
+        const double secondsRemaining = static_cast<double>(*window.resetsAt - now);
+        const double windowSeconds = static_cast<double>(window.minutes * 60);
+        result.expectedRemaining = std::clamp(
             static_cast<int>(std::lround(secondsRemaining / windowSeconds * 100.0)), 0, 100);
+    }
+    return result;
+}
+
+std::optional<UsageSnapshot> ParseWeeklyRemaining(std::string_view response) {
+    const auto result = ExtractObject(response, "\"result\"");
+    if (!result) return std::nullopt;
+
+    std::vector<ParsedWindow> windows;
+    if (const auto limits = ExtractObject(*result, "\"rateLimits\"")) {
+        windows = ParseRateLimitWindows(*limits);
+    }
+    // A few protocol versions only populate the multi-bucket view. The
+    // `codex` bucket is the one that represents this user's Codex allowance;
+    // other buckets (for example Spark) are separate limits.
+    if (windows.empty()) {
+        if (const auto buckets = ExtractObject(*result, "\"rateLimitsByLimitId\"")) {
+            if (const auto codex = ExtractObject(*buckets, "\"codex\"")) {
+                windows = ParseRateLimitWindows(*codex);
+            }
+        }
+    }
+    if (windows.empty()) return std::nullopt;
+
+    const auto weekly = std::max_element(windows.begin(), windows.end(),
+        [](const ParsedWindow& left, const ParsedWindow& right) {
+            return left.minutes < right.minutes;
+        });
+    UsageSnapshot snapshot;
+    snapshot.weekly = MakeUsageWindow(*weekly);
+
+    const auto shortWindow = std::min_element(windows.begin(), windows.end(),
+        [](const ParsedWindow& left, const ParsedWindow& right) {
+            return left.minutes < right.minutes;
+        });
+    if (windows.size() > 1 && shortWindow->minutes < weekly->minutes) {
+        snapshot.shortWindow = MakeUsageWindow(*shortWindow);
     }
     return snapshot;
 }
@@ -242,7 +316,7 @@ std::optional<UsageSnapshot> QueryWeeklyRemaining() {
     startup.hStdOutput = childOutWrite.get();
     startup.hStdError = childOutWrite.get();
     PROCESS_INFORMATION processInfo{};
-    std::wstring command = L"codex.exe app-server --stdio";
+    std::wstring command = L"\"" + CodexExecutable() + L"\" app-server --stdio";
     if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
             CREATE_NO_WINDOW, nullptr, nullptr, &startup, &processInfo)) {
         return std::nullopt;
@@ -271,14 +345,28 @@ std::optional<UsageSnapshot> QueryWeeklyRemaining() {
         if (line.find("\"id\":1") != std::string::npos) { initialized = true; break; }
     }
     if (!initialized || !WriteUtf8Line(childInWrite.get(), R"({"method":"initialized"})") ||
-        !WriteUtf8Line(childInWrite.get(), R"({"id":2,"method":"account/rateLimits/read","params":null})")) {
+        !WriteUtf8Line(childInWrite.get(), R"({"id":2,"method":"account/read","params":{"refreshToken":false}})")) {
         stopChild();
         return std::nullopt;
     }
 
     std::optional<UsageSnapshot> remaining;
+    bool accountRead = false;
     while (ReadUtf8Line(childOutRead.get(), process.get(), pending, line, deadline)) {
-        if (line.find("\"id\":2") != std::string::npos) {
+        if (!accountRead && line.find("\"id\":2") != std::string::npos) {
+            if (line.find("\"error\"") != std::string::npos) {
+                stopChild();
+                return std::nullopt;
+            }
+            accountRead = true;
+            if (!WriteUtf8Line(childInWrite.get(),
+                    R"({"id":3,"method":"account/rateLimits/read","params":{}})")) {
+                stopChild();
+                return std::nullopt;
+            }
+            continue;
+        }
+        if (accountRead && line.find("\"id\":3") != std::string::npos) {
             remaining = ParseWeeklyRemaining(line);
             break;
         }
@@ -344,12 +432,42 @@ bool AnyTaskActive(std::chrono::steady_clock::time_point deadline) {
     return false;
 }
 
+void DrawUsageRing(Graphics& graphics, const RectF& ring, float width,
+                   const UsageWindow& window, const Color& accent) {
+    const Color usedColor(255, 205, 205, 205);
+    Pen usedPen(usedColor, width);
+    Pen accentPen(accent, width);
+    usedPen.SetStartCap(LineCapRound); usedPen.SetEndCap(LineCapRound);
+    accentPen.SetStartCap(LineCapRound); accentPen.SetEndCap(LineCapRound);
+
+    const int used = 100 - window.remaining;
+    if (used > 0) graphics.DrawArc(&usedPen, ring, -90.0f, 3.6f * used);
+    if (window.remaining > 0) {
+        graphics.DrawArc(&accentPen, ring, -90.0f + 3.6f * used,
+            3.6f * window.remaining);
+    }
+}
+
+void DrawUsagePie(Graphics& graphics, const RectF& circle,
+                  const UsageWindow& window, const Color& accent) {
+    const Color usedColor(255, 205, 205, 205);
+    SolidBrush usedBrush(usedColor);
+    SolidBrush accentBrush(accent);
+
+    const int used = 100 - window.remaining;
+    if (used > 0) graphics.FillPie(&usedBrush, circle, -90.0f, 3.6f * used);
+    if (window.remaining > 0) {
+        graphics.FillPie(&accentBrush, circle, -90.0f + 3.6f * used,
+            3.6f * window.remaining);
+    }
+}
+
 HICON CreateStatusIcon(int remaining, int expectedRemaining, bool hasPercentage,
-                       bool apiAvailable, bool active) {
-    // Explorer renders notification icons at 16x16 logical pixels. Drawing a
-    // larger anti-aliased label and letting Explorer shrink it makes the text
-    // disappear, so both the ring and a tiny 3x5 pixel font are rendered at the
-    // final size.
+                       bool apiAvailable, bool active,
+                       const std::optional<UsageWindow>& shortWindow) {
+    // Explorer renders notification icons at 16x16 logical pixels. Draw the
+    // ring and inner pie at their final size so they remain distinct after
+    // Explorer's notification-area scaling.
     constexpr int size = 16;
     Bitmap bitmap(size, size, PixelFormat32bppARGB);
     Graphics graphics(&bitmap);
@@ -359,20 +477,28 @@ HICON CreateStatusIcon(int remaining, int expectedRemaining, bool hasPercentage,
     Color accent = active
         ? Color(255, 48, 139, 245)
         : Color(255, 128, 203, 255);
-    if (apiAvailable && expectedRemaining >= 0 && remaining < expectedRemaining) {
+    const bool weeklyBehind = expectedRemaining >= 0 && remaining < expectedRemaining;
+    const bool shortBehind = shortWindow && shortWindow->expectedRemaining >= 0 &&
+                             shortWindow->remaining < shortWindow->expectedRemaining;
+    if (apiAvailable && (weeklyBehind || shortBehind)) {
         accent = Color(255, 168, 85, 247);
     }
-    const Color usedColor(255, 205, 205, 205);
-    Pen usedPen(usedColor, 2.0f);
-    Pen accentPen(accent, 2.0f);
-    usedPen.SetStartCap(LineCapRound); usedPen.SetEndCap(LineCapRound);
-    accentPen.SetStartCap(LineCapRound); accentPen.SetEndCap(LineCapRound);
-    const RectF ring(2.0f, 2.0f, 12.0f, 12.0f);
+
     if (hasPercentage) {
-        const int used = 100 - remaining;
-        if (used > 0) graphics.DrawArc(&usedPen, ring, -90.0f, 3.6f * used);
-        if (remaining > 0) graphics.DrawArc(&accentPen, ring,
-            -90.0f + 3.6f * used, 3.6f * remaining);
+        const UsageWindow weekly{10080, remaining, expectedRemaining};
+        if (shortWindow) {
+            // When the service reports both windows, the outer ring is the
+            // short (normally five-hour) allowance and the inner pie is the
+            // weekly allowance. If a future service reports another duration,
+            // its shorter window is still displayed here with the same layout.
+            DrawUsageRing(graphics, RectF(1.0f, 1.0f, 14.0f, 14.0f), 2.0f,
+                *shortWindow, accent);
+            DrawUsagePie(graphics, RectF(4.5f, 4.5f, 7.0f, 7.0f),
+                weekly, accent);
+        } else {
+            DrawUsageRing(graphics, RectF(2.0f, 2.0f, 12.0f, 12.0f), 2.0f,
+                weekly, accent);
+        }
     }
 
     HICON icon = nullptr;
@@ -381,18 +507,27 @@ HICON CreateStatusIcon(int remaining, int expectedRemaining, bool hasPercentage,
 }
 
 std::wstring TooltipText() {
-    if (!g_hasPercentage) return L"Codex weekly usage unavailable";
-    std::wstring text = L"Codex: " + std::to_wstring(g_remaining) + L"% weekly remaining";
-    if (!g_apiAvailable) return text + L" (last known; API unavailable)";
-    if (g_expectedRemaining >= 0) {
+    if (!g_hasPercentage) return L"Codex usage\r\nWeekly usage unavailable";
+    std::wstring text = L"Codex usage\r\nWeekly: " + std::to_wstring(g_remaining) +
+                        L"% remaining";
+    if (g_apiAvailable && g_expectedRemaining >= 0) {
         text += L" (expected " + std::to_wstring(g_expectedRemaining) + L"%)";
     }
-    return text + (g_active ? L" - task active" : L" - idle / last task complete");
+    if (g_shortWindow) {
+        text += L"\r\n5-hour: " + std::to_wstring(g_shortWindow->remaining) +
+                L"% remaining";
+        if (g_apiAvailable && g_shortWindow->expectedRemaining >= 0) {
+            text += L" (expected " + std::to_wstring(g_shortWindow->expectedRemaining) + L"%)";
+        }
+    }
+    if (!g_apiAvailable) text += L"\r\nData: cached; API unavailable";
+    text += L"\r\nStatus: ";
+    return text + (g_active ? L"active" : L"idle (last complete)");
 }
 
 void AddOrUpdateTrayIcon(bool add) {
     HICON replacement = CreateStatusIcon(g_remaining, g_expectedRemaining,
-        g_hasPercentage, g_apiAvailable, g_active);
+        g_hasPercentage, g_apiAvailable, g_active, g_shortWindow);
     if (!replacement) return;
     NOTIFYICONDATAW data{};
     data.cbSize = sizeof(data);
@@ -446,8 +581,9 @@ void BeginRefresh() {
         }
         if (usage) {
             result->usageOk = true;
-            result->remaining = usage->remaining;
-            result->expectedRemaining = usage->expectedRemaining;
+            result->remaining = usage->weekly.remaining;
+            result->expectedRemaining = usage->weekly.expectedRemaining;
+            result->shortWindow = usage->shortWindow;
         }
         result->active = AnyTaskActive(std::chrono::steady_clock::now() + 3s);
         UpdateResult* raw = result.release();
@@ -498,6 +634,7 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         g_expectedRemaining = result->usageOk ? result->expectedRemaining : -1;
         if (result->usageOk) {
             g_remaining = result->remaining;
+            g_shortWindow = result->shortWindow;
             g_hasPercentage = true;
             // Refresh the file timestamp as a lightweight success heartbeat,
             // even when the percentage itself has not changed.
