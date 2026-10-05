@@ -1,6 +1,7 @@
 # Visual Studio build output
 /CodexUsageTray/
 /x64/
+/tests/bin/
 /.vs/
 *.user
 *.pdb

@@ -9,11 +9,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <cstdlib>
 #include <memory>
 #include <optional>
@@ -30,6 +32,7 @@ namespace {
 constexpr UINT kTrayCallback = WM_APP + 1;
 constexpr UINT kUpdateReady = WM_APP + 2;
 constexpr UINT_PTR kRefreshTimer = 1;
+constexpr auto kGrokRefreshInterval = 30min;
 constexpr UINT kTrayId = 1;
 constexpr UINT kMenuRefresh = 1001;
 constexpr UINT kMenuOpenCodex = 1002;
@@ -68,6 +71,7 @@ struct UpdateResult {
     std::optional<long long> resetsAt;
     std::optional<UsageWindow> shortWindow;
     bool active = false;
+    bool grokQueried = false;
     std::optional<GrokUsageSnapshot> grok;
     bool xaiApiConfigured = false;
     std::optional<long long> xaiApiCreditsCents;
@@ -78,6 +82,7 @@ HWND g_window = nullptr;
 HICON g_icon = nullptr;
 ULONG_PTR g_gdiplusToken = 0;
 std::atomic_bool g_refreshRunning = false;
+std::atomic_bool g_shuttingDown = false;
 int g_remaining = 0;
 bool g_hasPercentage = false;
 bool g_apiAvailable = false;
@@ -102,6 +107,7 @@ struct HandleCloser {
     }
 };
 using UniqueHandle = std::unique_ptr<void, HandleCloser>;
+UniqueHandle g_refreshThread;
 
 std::wstring GetEnvironment(const wchar_t* name) {
     const DWORD length = GetEnvironmentVariableW(name, nullptr, 0);
@@ -143,45 +149,6 @@ std::wstring GrokExecutable() {
         if (length < buffer.size()) return std::wstring(buffer.data(), length);
         buffer.resize(length + 1);
     }
-}
-
-std::string WideToUtf8(std::wstring_view value) {
-    if (value.empty()) return {};
-    const int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-        value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-    if (length <= 0) return {};
-    std::string result(static_cast<size_t>(length), '\0');
-    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-            value.data(), static_cast<int>(value.size()), result.data(), length,
-            nullptr, nullptr) != length) {
-        return {};
-    }
-    return result;
-}
-
-std::string JsonEscape(std::string_view value) {
-    std::string result;
-    result.reserve(value.size() + 8);
-    for (const char character : value) {
-        switch (character) {
-        case '\\': result += "\\\\"; break;
-        case '"': result += "\\\""; break;
-        case '\n': result += "\\n"; break;
-        case '\r': result += "\\r"; break;
-        case '\t': result += "\\t"; break;
-        default:
-            if (static_cast<unsigned char>(character) < 0x20) {
-                result += "\\u00";
-                constexpr char hex[] = "0123456789abcdef";
-                result.push_back(hex[(static_cast<unsigned char>(character) >> 4) & 0x0f]);
-                result.push_back(hex[static_cast<unsigned char>(character) & 0x0f]);
-            } else {
-                result.push_back(character);
-            }
-            break;
-        }
-    }
-    return result;
 }
 
 fs::path StateFile() {
@@ -233,7 +200,7 @@ bool WriteUtf8Line(HANDLE pipe, std::string_view line) {
 
 bool ReadUtf8Line(HANDLE pipe, HANDLE process, std::string& pending, std::string& line,
                   std::chrono::steady_clock::time_point deadline) {
-    while (std::chrono::steady_clock::now() < deadline) {
+    while (!g_shuttingDown && std::chrono::steady_clock::now() < deadline) {
         if (const size_t newline = pending.find('\n'); newline != std::string::npos) {
             line = pending.substr(0, newline);
             pending.erase(0, newline + 1);
@@ -595,89 +562,22 @@ std::optional<GrokUsageSnapshot> ParseGrokBilling(std::string_view response) {
 }
 
 bool IsJsonRpcResponseFor(std::string_view line, int id) {
-    const std::string needle = "\"id\":" + std::to_string(id);
-    return line.find(needle) != std::string_view::npos;
+    return ExtractInteger(line, "\"id\"") == id;
 }
 
-std::wstring GrokWorkingDirectory() {
-    if (const std::wstring profile = GetEnvironment(L"USERPROFILE"); !profile.empty()) {
-        return profile;
+class GrokRefreshSchedule {
+public:
+    bool Begin(std::chrono::steady_clock::time_point now, bool force) {
+        if (!force && now < nextRefresh_) return false;
+        // Failed attempts also wait 30 minutes, rather than retrying every minute.
+        nextRefresh_ = now + kGrokRefreshInterval;
+        return true;
     }
-    return L"C:\\";
-}
+private:
+    std::chrono::steady_clock::time_point nextRefresh_{};
+};
 
-std::optional<GrokUsageSnapshot> QueryGrokBilling() {
-    SECURITY_ATTRIBUTES attributes{sizeof(attributes), nullptr, TRUE};
-    HANDLE childOutReadRaw = nullptr, childOutWriteRaw = nullptr;
-    HANDLE childInReadRaw = nullptr, childInWriteRaw = nullptr;
-    if (!CreatePipe(&childOutReadRaw, &childOutWriteRaw, &attributes, 0)) return std::nullopt;
-    UniqueHandle childOutRead(childOutReadRaw), childOutWrite(childOutWriteRaw);
-    if (!SetHandleInformation(childOutRead.get(), HANDLE_FLAG_INHERIT, 0)) return std::nullopt;
-    if (!CreatePipe(&childInReadRaw, &childInWriteRaw, &attributes, 0)) return std::nullopt;
-    UniqueHandle childInRead(childInReadRaw), childInWrite(childInWriteRaw);
-    if (!SetHandleInformation(childInWrite.get(), HANDLE_FLAG_INHERIT, 0)) return std::nullopt;
-
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    startup.wShowWindow = SW_HIDE;
-    startup.hStdInput = childInRead.get();
-    startup.hStdOutput = childOutWrite.get();
-    startup.hStdError = childOutWrite.get();
-    PROCESS_INFORMATION processInfo{};
-    std::wstring command = L"\"" + GrokExecutable() +
-        L"\" agent --always-approve --no-leader stdio";
-    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
-            CREATE_NO_WINDOW, nullptr, nullptr, &startup, &processInfo)) {
-        return std::nullopt;
-    }
-    UniqueHandle process(processInfo.hProcess), thread(processInfo.hThread);
-    childInRead.reset();
-    childOutWrite.reset();
-
-    std::string pending, line;
-    const auto deadline = std::chrono::steady_clock::now() + 15s;
-    const auto stopChild = [&] {
-        childInWrite.reset();
-        if (WaitForSingleObject(process.get(), 1000) == WAIT_TIMEOUT) {
-            TerminateProcess(process.get(), 0);
-            WaitForSingleObject(process.get(), 1000);
-        }
-    };
-    const auto readResponse = [&](int id) {
-        while (ReadUtf8Line(childOutRead.get(), process.get(), pending, line, deadline)) {
-            if (IsJsonRpcResponseFor(line, id)) return true;
-        }
-        return false;
-    };
-
-    if (!WriteUtf8Line(childInWrite.get(),
-        R"({"id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"codex-usage-tray","version":"1.0"}}})") ||
-        !readResponse(1) || line.find("\"error\"") != std::string::npos) {
-        stopChild();
-        return std::nullopt;
-    }
-
-    const std::string cwd = JsonEscape(WideToUtf8(GrokWorkingDirectory()));
-    const std::string session =
-        "{\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"" +
-        cwd + R"(","mcpServers":[],"_meta":{"yoloMode":true}}})";
-    if (!WriteUtf8Line(childInWrite.get(), session) ||
-        !readResponse(2) || line.find("\"error\"") != std::string::npos) {
-        stopChild();
-        return std::nullopt;
-    }
-
-    if (!WriteUtf8Line(childInWrite.get(),
-        R"({"id":3,"method":"_x.ai/billing","params":{}})") ||
-        !readResponse(3)) {
-        stopChild();
-        return std::nullopt;
-    }
-    const auto result = ParseGrokBilling(line);
-    stopChild();
-    return result;
-}
+GrokRefreshSchedule g_grokSchedule;
 
 bool IsSafeTeamId(std::wstring_view value) {
     if (value.empty()) return false;
@@ -754,90 +654,499 @@ std::optional<XaiApiCreditsSnapshot> ParseXaiApiCredits(
     return snapshot;
 }
 
-std::optional<std::string> QueryXaiManagementApi(std::wstring_view path,
-                                                 const std::wstring& managementKey) {
-    HINTERNET session = WinHttpOpen(L"CodexUsageTray/1.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) return std::nullopt;
-    const auto close = [](HINTERNET handle) {
+struct InternetHandleCloser {
+    void operator()(void* handle) const noexcept {
         if (handle) WinHttpCloseHandle(handle);
-    };
-    HINTERNET connection = WinHttpConnect(session, L"management-api.x.ai",
-        INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!connection) {
-        close(session);
-        return std::nullopt;
     }
-    const std::wstring requestPath(path);
-    HINTERNET request = WinHttpOpenRequest(connection, L"GET", requestPath.c_str(),
-        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-        WINHTTP_FLAG_SECURE);
-    if (!request) {
-        close(connection);
-        close(session);
-        return std::nullopt;
-    }
-    WinHttpSetTimeouts(request, 3000, 3000, 5000, 5000);
-    const std::wstring header = L"Authorization: Bearer " + managementKey;
-    const bool sent = WinHttpAddRequestHeaders(request, header.c_str(),
-        static_cast<DWORD>(header.size()),
-        WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE) &&
-        WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(request, nullptr);
-    if (!sent) {
-        close(request);
-        close(connection);
-        close(session);
-        return std::nullopt;
-    }
+};
+using UniqueInternetHandle = std::unique_ptr<void, InternetHandleCloser>;
 
+struct HttpJsonResponse {
     DWORD status = 0;
-    DWORD statusSize = sizeof(status);
-    if (!WinHttpQueryHeaders(request,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize,
-            WINHTTP_NO_HEADER_INDEX) || status < 200 || status >= 300) {
-        close(request);
-        close(connection);
-        close(session);
+    std::string body;
+};
+
+std::optional<HttpJsonResponse> GetJsonHttps(const wchar_t* host,
+        const wchar_t* path, const std::wstring& headers) {
+    if (g_shuttingDown) return std::nullopt;
+    UniqueInternetHandle session(WinHttpOpen(L"CodexUsageTray/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0));
+    if (!session) return std::nullopt;
+    UniqueInternetHandle connection(WinHttpConnect(session.get(), host,
+        INTERNET_DEFAULT_HTTPS_PORT, 0));
+    if (!connection) return std::nullopt;
+    UniqueInternetHandle request(WinHttpOpenRequest(connection.get(), L"GET", path,
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE));
+    if (!request) return std::nullopt;
+
+    DWORD disabled = WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES;
+    DWORD compression = WINHTTP_DECOMPRESSION_FLAG_GZIP | WINHTTP_DECOMPRESSION_FLAG_DEFLATE;
+    if (!WinHttpSetOption(request.get(), WINHTTP_OPTION_DISABLE_FEATURE, &disabled, sizeof(disabled)) ||
+        !WinHttpSetOption(request.get(), WINHTTP_OPTION_DECOMPRESSION, &compression, sizeof(compression)) ||
+        !WinHttpSetTimeouts(request.get(), 3000, 3000, 5000, 5000) ||
+        !WinHttpAddRequestHeaders(request.get(), headers.c_str(), static_cast<DWORD>(headers.size()),
+            WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE) ||
+        !WinHttpSendRequest(request.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) || !WinHttpReceiveResponse(request.get(), nullptr)) {
         return std::nullopt;
     }
-
-    std::string body;
+    HttpJsonResponse response;
+    DWORD statusSize = sizeof(response.status);
+    if (!WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &response.status, &statusSize, WINHTTP_NO_HEADER_INDEX)) {
+        return std::nullopt;
+    }
+    // Preserve the status for authentication recovery; discard error bodies.
+    if (response.status < 200 || response.status >= 300) return response;
     for (;;) {
+        if (g_shuttingDown) return std::nullopt;
         DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(request, &available)) {
-            close(request);
-            close(connection);
-            close(session);
-            return std::nullopt;
-        }
+        if (!WinHttpQueryDataAvailable(request.get(), &available)) return std::nullopt;
         if (!available) break;
-        if (body.size() + available > 1'000'000) {
-            close(request);
-            close(connection);
-            close(session);
-            return std::nullopt;
-        }
-        const size_t start = body.size();
-        body.resize(start + available);
+        if (response.body.size() + available > 1'000'000) return std::nullopt;
+        const size_t start = response.body.size();
+        response.body.resize(start + available);
         DWORD read = 0;
-        if (!WinHttpReadData(request, body.data() + start, available, &read)) {
-            close(request);
-            close(connection);
-            close(session);
+        if (!WinHttpReadData(request.get(), response.body.data() + start, available, &read)) {
             return std::nullopt;
         }
-        body.resize(start + read);
+        response.body.resize(start + read);
         if (!read) break;
     }
-
-    close(request);
-    close(connection);
-    close(session);
-    return body;
+    return response;
 }
+
+std::optional<std::string> QueryXaiManagementApi(std::wstring_view path,
+                                               const std::wstring& managementKey) {
+    const std::wstring requestPath(path);
+    auto response = GetJsonHttps(L"management-api.x.ai", requestPath.c_str(),
+        L"Authorization: Bearer " + managementKey);
+    if (!response || response->status < 200 || response->status >= 300) return std::nullopt;
+    return std::move(response->body);
+}
+
+// Return only immediate object members, so credentials cannot mix fields from
+// different account entries. String views stay within the bounded source file.
+using JsonFields = std::vector<std::pair<std::string_view, std::string_view>>;
+std::optional<JsonFields> JsonObjectFields(std::string_view json) {
+    size_t at = 0;
+    const auto skipSpace = [&] {
+        while (at < json.size() && (json[at] == ' ' || json[at] == '\t' ||
+                json[at] == '\r' || json[at] == '\n')) ++at;
+    };
+    const auto scanString = [&]() -> bool {
+        if (at >= json.size() || json[at++] != '"') return false;
+        while (at < json.size()) {
+            const char c = json[at++];
+            if (static_cast<unsigned char>(c) < 32) return false;
+            if (c == '"') return true;
+            if (c == '\\') {
+                if (at == json.size()) return false;
+                ++at;
+            }
+        }
+        return false;
+    };
+    skipSpace();
+    if (at == json.size() || json[at++] != '{') return std::nullopt;
+    JsonFields fields;
+    skipSpace();
+    if (at < json.size() && json[at] == '}') {
+        ++at;
+        skipSpace();
+        return at == json.size() ? std::optional<JsonFields>(fields) : std::nullopt;
+    }
+    for (;;) {
+        skipSpace();
+        const size_t keyStart = at;
+        if (!scanString()) return std::nullopt;
+        const auto key = json.substr(keyStart + 1, at - keyStart - 2);
+        skipSpace();
+        if (at == json.size() || json[at++] != ':') return std::nullopt;
+        skipSpace();
+        const size_t valueStart = at;
+        if (at == json.size()) return std::nullopt;
+        if (json[at] == '"') {
+            if (!scanString()) return std::nullopt;
+        } else if (json[at] == '{' || json[at] == '[') {
+            std::string closers;
+            do {
+                const char c = json[at];
+                if (c == '"') {
+                    if (!scanString()) return std::nullopt;
+                    continue;
+                }
+                ++at;
+                if (c == '{') closers += '}';
+                else if (c == '[') closers += ']';
+                else if (c == '}' || c == ']') {
+                    if (closers.empty() || closers.back() != c) return std::nullopt;
+                    closers.pop_back();
+                }
+                if (closers.size() > 32) return std::nullopt;
+            } while (!closers.empty() && at < json.size());
+            if (!closers.empty()) return std::nullopt;
+        } else {
+            while (at < json.size() && json[at] != ',' && json[at] != '}') ++at;
+            if (at == valueStart) return std::nullopt;
+        }
+        if (std::any_of(fields.begin(), fields.end(), [key](const auto& field) { return field.first == key; })) {
+            return std::nullopt;
+        }
+        fields.emplace_back(key, json.substr(valueStart, at - valueStart));
+        skipSpace();
+        if (at == json.size()) return std::nullopt;
+        const char separator = json[at++];
+        if (separator == '}') {
+            skipSpace();
+            return at == json.size() ? std::optional<JsonFields>(fields) : std::nullopt;
+        }
+        if (separator != ',') return std::nullopt;
+    }
+}
+
+std::optional<std::string_view> JsonPlainString(const JsonFields& fields, std::string_view key) {
+    for (const auto& [name, raw] : fields) {
+        if (name != key) continue;
+        if (raw.size() < 2 || raw.front() != '"' || raw.back() != '"') return std::nullopt;
+        const auto value = raw.substr(1, raw.size() - 2);
+        // Credential keys, IDs, scopes and timestamps contain no JSON escapes.
+        if (value.find('\\') != std::string_view::npos) return std::nullopt;
+        return value;
+    }
+    return std::nullopt;
+}
+
+bool SafeHeaderValue(std::string_view value) {
+    return !value.empty() && value.size() <= 16'384 &&
+        std::all_of(value.begin(), value.end(), [](unsigned char c) { return c >= 33 && c <= 126; });
+}
+
+std::optional<std::string_view> JsonField(const JsonFields& fields, std::string_view key) {
+    for (const auto& [name, value] : fields) {
+        if (name == key) {
+            auto trimmed = value;
+            while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t' ||
+                    trimmed.back() == '\r' || trimmed.back() == '\n')) trimmed.remove_suffix(1);
+            return trimmed;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<long long> JsonInteger(const JsonFields& fields, std::string_view key) {
+    const auto raw = JsonField(fields, key);
+    if (!raw) return std::nullopt;
+    const auto value = *raw;
+    long long result = 0;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
+    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()) return std::nullopt;
+    return result;
+}
+
+std::optional<std::string> DecodeBase64Url(std::string_view value) {
+    if (value.empty() || value.size() > 16'384 || value.size() % 4 == 1) return std::nullopt;
+    std::string decoded;
+    unsigned int accumulator = 0;
+    int bits = 0;
+    for (const char c : value) {
+        const size_t digit = std::string_view(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_").find(c);
+        if (digit == std::string_view::npos) return std::nullopt;
+        accumulator = (accumulator << 6) | static_cast<unsigned int>(digit);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            decoded += static_cast<char>((accumulator >> bits) & 255);
+        }
+    }
+    if (bits && (accumulator & ((1u << bits) - 1u))) return std::nullopt;
+    return decoded;
+}
+
+struct CodexCredentials {
+    std::string token;
+    std::string accountId;
+    long long expiresAt = 0;
+};
+
+std::optional<CodexCredentials> ParseCodexCredentials(std::string_view json) {
+    const auto root = JsonObjectFields(json);
+    if (!root) return std::nullopt;
+    // Legacy ChatGPT auth files omit auth_mode. API-key and external-token
+    // modes must not be refreshed using Codex's managed OAuth lifecycle.
+    if (JsonField(*root, "auth_mode") && JsonPlainString(*root, "auth_mode") != "chatgpt") {
+        return std::nullopt;
+    }
+    const auto rawTokens = JsonField(*root, "tokens");
+    if (!rawTokens) return std::nullopt;
+    const auto tokens = JsonObjectFields(*rawTokens);
+    if (!tokens) return std::nullopt;
+    const auto token = JsonPlainString(*tokens, "access_token");
+    const auto accountId = JsonPlainString(*tokens, "account_id");
+    if (!token || !accountId || !SafeHeaderValue(*token) || !SafeHeaderValue(*accountId)) {
+        return std::nullopt;
+    }
+    const size_t first = token->find('.');
+    const size_t second = first == std::string_view::npos ? first : token->find('.', first + 1);
+    if (first == std::string_view::npos || second == std::string_view::npos ||
+            first == 0 || second + 1 == token->size() || token->find('.', second + 1) != std::string_view::npos) {
+        return std::nullopt;
+    }
+    auto payload = DecodeBase64Url(token->substr(first + 1, second - first - 1));
+    if (!payload) return std::nullopt;
+    const auto claims = JsonObjectFields(*payload);
+    const auto expiry = claims ? JsonInteger(*claims, "exp") : std::nullopt;
+    SecureZeroMemory(payload->data(), payload->size());
+    // JWT decoding is only an expiry hint; the HTTPS service authenticates it.
+    if (!expiry || *expiry <= 0) return std::nullopt;
+    return CodexCredentials{std::string(*token), std::string(*accountId), *expiry};
+}
+
+fs::path CodexAuthFile() {
+    const auto configured = GetEnvironment(L"CODEX_HOME");
+    if (!configured.empty()) return fs::path(configured) / L"auth.json";
+    const auto profile = GetEnvironment(L"USERPROFILE");
+    return profile.empty() ? fs::path{} : fs::path(profile) / L".codex" / L"auth.json";
+}
+
+std::optional<CodexCredentials> LoadCodexCredentials() {
+    std::ifstream input(CodexAuthFile(), std::ios::binary | std::ios::ate);
+    if (!input) return std::nullopt;
+    const auto size = input.tellg();
+    if (size <= 0 || size > 1'000'000) return std::nullopt;
+    input.seekg(0);
+    std::string json(static_cast<size_t>(size), '\0');
+    const bool read = static_cast<bool>(input.read(json.data(), static_cast<std::streamsize>(json.size())));
+    auto credentials = read ? ParseCodexCredentials(json) : std::nullopt;
+    SecureZeroMemory(json.data(), json.size());
+    return credentials;
+}
+
+std::optional<HttpJsonResponse> RequestCodexUsage(const CodexCredentials& credentials) {
+    if (!SafeHeaderValue(credentials.token) || !SafeHeaderValue(credentials.accountId)) return std::nullopt;
+    std::wstring headers = L"Authorization: Bearer " +
+        std::wstring(credentials.token.begin(), credentials.token.end()) +
+        L"\r\nChatGPT-Account-Id: " + std::wstring(credentials.accountId.begin(), credentials.accountId.end()) +
+        L"\r\nAccept: application/json";
+    auto response = GetJsonHttps(L"chatgpt.com", L"/backend-api/wham/usage", headers);
+    SecureZeroMemory(headers.data(), headers.size() * sizeof(wchar_t));
+    return response;
+}
+
+std::optional<UsageSnapshot> ParseCodexUsage(std::string_view response) {
+    const auto root = JsonObjectFields(response);
+    if (!root) return std::nullopt;
+    const auto rawLimits = JsonField(*root, "rate_limit");
+    if (!rawLimits) return std::nullopt;
+    const auto limits = JsonObjectFields(*rawLimits);
+    if (!limits) return std::nullopt;
+    std::vector<ParsedWindow> windows;
+    for (const auto key : {"primary_window", "secondary_window"}) {
+        const auto rawWindow = JsonField(*limits, key);
+        if (!rawWindow || *rawWindow == "null") continue;
+        const auto window = JsonObjectFields(*rawWindow);
+        if (!window) return std::nullopt;
+        const auto used = JsonInteger(*window, "used_percent");
+        const auto seconds = JsonInteger(*window, "limit_window_seconds");
+        const auto resetsAt = JsonInteger(*window, "reset_at");
+        if (!used || *used < 0 || *used > 100 || !seconds || *seconds <= 0 ||
+                *seconds % 60 != 0 || *seconds > 365LL * 24 * 60 * 60 || !resetsAt || *resetsAt <= 0) {
+            return std::nullopt;
+        }
+        windows.push_back({*seconds / 60, *used, resetsAt});
+    }
+    if (windows.empty()) return std::nullopt;
+    std::sort(windows.begin(), windows.end(), [](const ParsedWindow& left, const ParsedWindow& right) {
+        return left.minutes < right.minutes;
+    });
+    UsageSnapshot snapshot;
+    snapshot.weekly = MakeUsageWindow(windows.back());
+    if (windows.size() > 1 && windows.front().minutes < windows.back().minutes) {
+        snapshot.shortWindow = MakeUsageWindow(windows.front());
+    }
+    return snapshot;
+}
+
+struct GrokCredentials {
+    std::string token;
+    std::string userId;
+    std::optional<long long> expiresAt;
+};
+
+std::optional<GrokCredentials> ParseGrokCredentials(std::string_view json) {
+    const auto scopes = JsonObjectFields(json);
+    if (!scopes) return std::nullopt;
+    std::optional<GrokCredentials> selected;
+    for (const auto& [scope, entry] : *scopes) {
+        // Send only the first-party cached login to the first-party billing host.
+        if (!scope.starts_with("https://auth.x.ai::")) continue;
+        const auto fields = JsonObjectFields(entry);
+        if (!fields) continue;
+        const auto mode = JsonPlainString(*fields, "auth_mode");
+        const auto token = JsonPlainString(*fields, "key");
+        const auto userId = JsonPlainString(*fields, "user_id");
+        if (!mode || *mode != "oidc" || !token || !userId ||
+                !SafeHeaderValue(*token) || !SafeHeaderValue(*userId)) continue;
+        GrokCredentials credentials{std::string(*token), std::string(*userId), std::nullopt};
+        if (const auto expiry = JsonPlainString(*fields, "expires_at")) {
+            credentials.expiresAt = ParseRfc3339Timestamp(*expiry);
+            if (!credentials.expiresAt) continue;
+        } else if (const auto created = JsonPlainString(*fields, "create_time")) {
+            if (const auto timestamp = ParseRfc3339Timestamp(*created)) {
+                credentials.expiresAt = *timestamp + 30LL * 24 * 60 * 60;
+            } else continue;
+        }
+        if (!selected || credentials.expiresAt.value_or(0) > selected->expiresAt.value_or(0)) {
+            selected = std::move(credentials);
+        }
+    }
+    return selected;
+}
+
+fs::path GrokAuthFile() {
+    const std::wstring configured = GetEnvironment(L"GROK_HOME");
+    if (!configured.empty()) return fs::path(configured) / L"auth.json";
+    const std::wstring profile = GetEnvironment(L"USERPROFILE");
+    return profile.empty() ? fs::path{} : fs::path(profile) / L".grok" / L"auth.json";
+}
+
+std::optional<GrokCredentials> LoadGrokCredentials() {
+    std::ifstream input(GrokAuthFile(), std::ios::binary | std::ios::ate);
+    if (!input) return std::nullopt;
+    const std::streamoff size = input.tellg();
+    if (size <= 0 || size > 1'000'000) return std::nullopt;
+    std::string json(static_cast<size_t>(size), '\0');
+    input.seekg(0);
+    if (!input.read(json.data(), size)) return std::nullopt;
+    auto credentials = ParseGrokCredentials(json);
+    SecureZeroMemory(json.data(), json.size());
+    return credentials;
+}
+
+std::optional<HttpJsonResponse> RequestGrokBilling(const GrokCredentials& credentials) {
+    if (!SafeHeaderValue(credentials.token) || !SafeHeaderValue(credentials.userId)) return std::nullopt;
+    const std::wstring token(credentials.token.begin(), credentials.token.end());
+    const std::wstring userId(credentials.userId.begin(), credentials.userId.end());
+    std::wstring headers = L"Authorization: Bearer " + token +
+        L"\r\nX-XAI-Token-Auth: xai-grok-cli\r\nx-userid: " + userId +
+        L"\r\nAccept: application/json";
+    auto response = GetJsonHttps(L"cli-chat-proxy.grok.com", L"/v1/billing?format=credits", headers);
+    SecureZeroMemory(headers.data(), headers.size() * sizeof(wchar_t));
+    return response;
+}
+
+bool RefreshGrokCredentials() {
+    // Let the CLI own OAuth rotation and auth.json locking. This is used only
+    // near token expiry or after a rejected token, never for normal polls.
+    if (g_shuttingDown) return false;
+    SECURITY_ATTRIBUTES attributes{sizeof(attributes), nullptr, TRUE};
+    HANDLE outReadRaw = nullptr, outWriteRaw = nullptr, inReadRaw = nullptr, inWriteRaw = nullptr;
+    if (!CreatePipe(&outReadRaw, &outWriteRaw, &attributes, 0)) return false;
+    UniqueHandle outRead(outReadRaw), outWrite(outWriteRaw);
+    if (!SetHandleInformation(outRead.get(), HANDLE_FLAG_INHERIT, 0)) return false;
+    if (!CreatePipe(&inReadRaw, &inWriteRaw, &attributes, 0)) return false;
+    UniqueHandle inRead(inReadRaw), inWrite(inWriteRaw);
+    if (!SetHandleInformation(inWrite.get(), HANDLE_FLAG_INHERIT, 0)) return false;
+    UniqueHandle job(CreateJobObjectW(nullptr, nullptr));
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!job || !SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+        return false;
+    }
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+    startup.hStdInput = inRead.get();
+    startup.hStdOutput = outWrite.get();
+    startup.hStdError = outWrite.get();
+    PROCESS_INFORMATION info{};
+    std::wstring command = L"\"" + GrokExecutable() + L"\" agent --no-leader stdio";
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &startup, &info)) return false;
+    UniqueHandle process(info.hProcess), thread(info.hThread);
+    if (!AssignProcessToJobObject(job.get(), process.get())) {
+        TerminateProcess(process.get(), 0);
+        WaitForSingleObject(process.get(), 1000);
+        return false;
+    }
+    if (ResumeThread(thread.get()) == static_cast<DWORD>(-1)) return false;
+    inRead.reset();
+    outWrite.reset();
+    const auto deadline = std::chrono::steady_clock::now() + 15s;
+    std::string pending, line;
+    const auto exchange = [&](int id, std::string_view rpc) {
+        std::string message(rpc);
+        message += '\n';
+        DWORD written = 0;
+        if (!WriteFile(inWrite.get(), message.data(), static_cast<DWORD>(message.size()), &written, nullptr) ||
+                written != message.size()) return false;
+        while (ReadUtf8Line(outRead.get(), process.get(), pending, line, deadline)) {
+            if (IsJsonRpcResponseFor(line, id)) return line.find("\"error\"") == std::string::npos;
+            if (pending.size() > 1'000'000) return false;
+        }
+        return false;
+    };
+    const bool ready = exchange(1,
+        R"({"id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"codex-usage-tray","version":"1.0"}}})") &&
+        exchange(2, R"({"id":2,"method":"_x.ai/billing","params":{}})");
+    inWrite.reset();
+    if (WaitForSingleObject(process.get(), 1000) == WAIT_TIMEOUT) {
+        TerminateJobObject(job.get(), 0);
+        WaitForSingleObject(process.get(), 1000);
+    }
+    return ready;
+}
+
+class GrokBillingClient {
+public:
+    using Loader = std::function<std::optional<GrokCredentials>()>;
+    using Request = std::function<std::optional<HttpJsonResponse>(const GrokCredentials&)>;
+    using Refresh = std::function<bool()>;
+
+    GrokBillingClient(Loader load = LoadGrokCredentials, Request request = RequestGrokBilling,
+                     Refresh refresh = RefreshGrokCredentials)
+        : load_(std::move(load)), request_(std::move(request)), refresh_(std::move(refresh)) {}
+
+    std::optional<GrokUsageSnapshot> Query(long long now = static_cast<long long>(std::time(nullptr))) {
+        if (g_shuttingDown) return std::nullopt;
+        auto credentials = load_();
+        if (!credentials) return std::nullopt;
+        bool refreshed = false;
+        const auto nearExpiry = [now](const GrokCredentials& value) {
+            return value.expiresAt && now >= *value.expiresAt - 300;
+        };
+        if (nearExpiry(*credentials)) {
+            if (!refresh_()) return std::nullopt;
+            refreshed = true;
+            credentials = load_();
+            if (!credentials || nearExpiry(*credentials)) return std::nullopt;
+        }
+        auto response = request_(*credentials);
+        if (response && (response->status == 401 || response->status == 403) && !refreshed) {
+            // Another Grok process may already have rotated the shared login.
+            auto current = load_();
+            if (!current || current->token == credentials->token || nearExpiry(*current)) {
+                if (!refresh_()) return std::nullopt;
+                current = load_();
+            }
+            if (!current || nearExpiry(*current)) return std::nullopt;
+            response = request_(*current);
+        }
+        if (!response || response->status < 200 || response->status >= 300) return std::nullopt;
+        // The HTTPS endpoint returns the billing object without an ACP result envelope.
+        return ParseGrokBilling("{\"result\":" + response->body + "}");
+    }
+
+private:
+    Loader load_;
+    Request request_;
+    Refresh refresh_;
+};
+
+GrokBillingClient g_grokClient;
 
 std::optional<XaiApiCreditsSnapshot> QueryXaiApiCredits() {
     const std::wstring managementKey = GetEnvironment(L"XAI_MANAGEMENT_API_KEY");
@@ -860,16 +1169,25 @@ std::optional<XaiApiCreditsSnapshot> QueryXaiApiCredits() {
     return ParseXaiApiCredits(prepaidResponse, previewResponse);
 }
 
-std::optional<UsageSnapshot> QueryWeeklyRemaining() {
+bool RefreshCodexCredentials() {
+    // Codex owns token rotation and shared credential-store writes. No model
+    // requests or usage reads are needed for this occasional auth refresh.
+    if (g_shuttingDown) return false;
     SECURITY_ATTRIBUTES attributes{sizeof(attributes), nullptr, TRUE};
     HANDLE childOutReadRaw = nullptr, childOutWriteRaw = nullptr;
     HANDLE childInReadRaw = nullptr, childInWriteRaw = nullptr;
-    if (!CreatePipe(&childOutReadRaw, &childOutWriteRaw, &attributes, 0)) return std::nullopt;
+    if (!CreatePipe(&childOutReadRaw, &childOutWriteRaw, &attributes, 0)) return false;
     UniqueHandle childOutRead(childOutReadRaw), childOutWrite(childOutWriteRaw);
-    if (!SetHandleInformation(childOutRead.get(), HANDLE_FLAG_INHERIT, 0)) return std::nullopt;
-    if (!CreatePipe(&childInReadRaw, &childInWriteRaw, &attributes, 0)) return std::nullopt;
+    if (!SetHandleInformation(childOutRead.get(), HANDLE_FLAG_INHERIT, 0)) return false;
+    if (!CreatePipe(&childInReadRaw, &childInWriteRaw, &attributes, 0)) return false;
     UniqueHandle childInRead(childInReadRaw), childInWrite(childInWriteRaw);
-    if (!SetHandleInformation(childInWrite.get(), HANDLE_FLAG_INHERIT, 0)) return std::nullopt;
+    if (!SetHandleInformation(childInWrite.get(), HANDLE_FLAG_INHERIT, 0)) return false;
+    UniqueHandle job(CreateJobObjectW(nullptr, nullptr));
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!job || !SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+        return false;
+    }
 
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
@@ -881,19 +1199,25 @@ std::optional<UsageSnapshot> QueryWeeklyRemaining() {
     PROCESS_INFORMATION processInfo{};
     std::wstring command = L"\"" + CodexExecutable() + L"\" app-server --stdio";
     if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
-            CREATE_NO_WINDOW, nullptr, nullptr, &startup, &processInfo)) {
-        return std::nullopt;
+            CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &startup, &processInfo)) {
+        return false;
     }
     UniqueHandle process(processInfo.hProcess), thread(processInfo.hThread);
+    if (!AssignProcessToJobObject(job.get(), process.get())) {
+        TerminateProcess(process.get(), 0);
+        WaitForSingleObject(process.get(), 1000);
+        return false;
+    }
+    if (ResumeThread(thread.get()) == static_cast<DWORD>(-1)) return false;
     childInRead.reset();
     childOutWrite.reset();
 
     std::string pending, line;
-    const auto deadline = std::chrono::steady_clock::now() + 30s;
+    const auto deadline = std::chrono::steady_clock::now() + 15s;
     const auto stopChild = [&] {
         childInWrite.reset();
         if (WaitForSingleObject(process.get(), 1000) == WAIT_TIMEOUT) {
-            TerminateProcess(process.get(), 0);
+            TerminateJobObject(job.get(), 0);
             WaitForSingleObject(process.get(), 1000);
         }
     };
@@ -901,41 +1225,86 @@ std::optional<UsageSnapshot> QueryWeeklyRemaining() {
     if (!WriteUtf8Line(childInWrite.get(),
         R"({"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-usage-tray","version":"1.0"},"capabilities":{"experimentalApi":true}}})")) {
         stopChild();
-        return std::nullopt;
+        return false;
     }
     bool initialized = false;
     while (ReadUtf8Line(childOutRead.get(), process.get(), pending, line, deadline)) {
-        if (line.find("\"id\":1") != std::string::npos) { initialized = true; break; }
-    }
-    if (!initialized || !WriteUtf8Line(childInWrite.get(), R"({"method":"initialized"})") ||
-        !WriteUtf8Line(childInWrite.get(), R"({"id":2,"method":"account/read","params":{"refreshToken":false}})")) {
-        stopChild();
-        return std::nullopt;
-    }
-
-    std::optional<UsageSnapshot> remaining;
-    bool accountRead = false;
-    while (ReadUtf8Line(childOutRead.get(), process.get(), pending, line, deadline)) {
-        if (!accountRead && line.find("\"id\":2") != std::string::npos) {
-            if (line.find("\"error\"") != std::string::npos) {
-                stopChild();
-                return std::nullopt;
-            }
-            accountRead = true;
-            if (!WriteUtf8Line(childInWrite.get(),
-                    R"({"id":3,"method":"account/rateLimits/read","params":{}})")) {
-                stopChild();
-                return std::nullopt;
-            }
-            continue;
-        }
-        if (accountRead && line.find("\"id\":3") != std::string::npos) {
-            remaining = ParseWeeklyRemaining(line);
+        if (IsJsonRpcResponseFor(line, 1)) {
+            initialized = line.find("\"error\"") == std::string::npos;
             break;
         }
     }
+    if (!initialized || !WriteUtf8Line(childInWrite.get(), R"({"method":"initialized"})") ||
+        !WriteUtf8Line(childInWrite.get(), R"({"id":2,"method":"account/read","params":{"refreshToken":true}})")) {
+        stopChild();
+        return false;
+    }
+
+    bool refreshed = false;
+    while (ReadUtf8Line(childOutRead.get(), process.get(), pending, line, deadline)) {
+        if (IsJsonRpcResponseFor(line, 2)) {
+            const auto result = ExtractObject(line, "\"result\"");
+            const auto account = result ? ExtractObject(*result, "\"account\"") : std::nullopt;
+            const auto fields = account ? JsonObjectFields(*account) : std::nullopt;
+            refreshed = line.find("\"error\"") == std::string::npos && fields &&
+                JsonPlainString(*fields, "type") == "chatgpt";
+            break;
+        }
+        if (pending.size() > 1'000'000) break;
+    }
     stopChild();
-    return remaining;
+    return refreshed;
+}
+
+class CodexUsageClient {
+public:
+    using Loader = std::function<std::optional<CodexCredentials>()>;
+    using Request = std::function<std::optional<HttpJsonResponse>(const CodexCredentials&)>;
+    using Refresh = std::function<bool()>;
+
+    CodexUsageClient(Loader load = LoadCodexCredentials, Request request = RequestCodexUsage,
+                     Refresh refresh = RefreshCodexCredentials)
+        : load_(std::move(load)), request_(std::move(request)), refresh_(std::move(refresh)) {}
+
+    std::optional<UsageSnapshot> Query(long long now = static_cast<long long>(std::time(nullptr))) {
+        if (g_shuttingDown) return std::nullopt;
+        auto credentials = load_();
+        if (!credentials) return std::nullopt;
+        const auto nearExpiry = [now](const CodexCredentials& value) {
+            return now >= value.expiresAt - 300;
+        };
+        bool refreshed = false;
+        if (nearExpiry(*credentials)) {
+            if (!refresh_()) return std::nullopt;
+            refreshed = true;
+            credentials = load_();
+            if (!credentials || nearExpiry(*credentials)) return std::nullopt;
+        }
+        auto response = request_(*credentials);
+        if (response && response->status == 401 && !refreshed) {
+            // Prefer a login already rotated by the desktop app or another CLI.
+            auto current = load_();
+            if (!current || current->token == credentials->token || nearExpiry(*current)) {
+                if (!refresh_()) return std::nullopt;
+                current = load_();
+            }
+            if (!current || nearExpiry(*current)) return std::nullopt;
+            response = request_(*current);
+        }
+        if (!response || response->status < 200 || response->status >= 300) return std::nullopt;
+        return ParseCodexUsage(response->body);
+    }
+
+private:
+    Loader load_;
+    Request request_;
+    Refresh refresh_;
+};
+
+CodexUsageClient g_codexClient;
+
+std::optional<UsageSnapshot> QueryWeeklyRemaining() {
+    return g_codexClient.Query();
 }
 
 bool HasRecentOpenTask(const fs::path& file,
@@ -1116,13 +1485,6 @@ std::wstring TooltipText() {
     text += L"\r\nGrok 7d: ";
     if (g_grokAvailable && g_grokSubscriptionRemaining) {
         text += std::to_wstring(*g_grokSubscriptionRemaining) + L"%";
-        if (g_grokExpectedRemaining >= 0) {
-            text += L" (expected " + std::to_wstring(g_grokExpectedRemaining) + L"%)";
-        }
-        if (const std::wstring reset = FormatResetTime(g_grokResetsAt, true);
-            !reset.empty()) {
-            text += L" - " + reset;
-        }
     } else {
         text += L"n/a";
     }
@@ -1181,10 +1543,11 @@ void OpenCodex() {
     }
 }
 
-void BeginRefresh() {
+void BeginRefresh(bool forceGrok = false) {
+    if (g_shuttingDown) return;
     bool expected = false;
     if (!g_refreshRunning.compare_exchange_strong(expected, true)) return;
-    const uintptr_t thread = _beginthreadex(nullptr, 0, [](void*) -> unsigned {
+    const uintptr_t thread = _beginthreadex(nullptr, 0, [](void* context) -> unsigned {
         auto result = std::make_unique<UpdateResult>();
         auto usage = QueryWeeklyRemaining();
         if (!usage) {
@@ -1198,7 +1561,10 @@ void BeginRefresh() {
             result->resetsAt = usage->weekly.resetsAt;
             result->shortWindow = usage->shortWindow;
         }
-        result->grok = QueryGrokBilling();
+        if (!g_shuttingDown && g_grokSchedule.Begin(std::chrono::steady_clock::now(), context != nullptr)) {
+            result->grokQueried = true;
+            result->grok = g_grokClient.Query();
+        }
         result->xaiApiConfigured = XaiApiConfigured();
         if (result->xaiApiConfigured) {
             if (const auto xai = QueryXaiApiCredits()) {
@@ -1210,8 +1576,8 @@ void BeginRefresh() {
         UpdateResult* raw = result.release();
         if (!PostMessageW(g_window, kUpdateReady, 0, reinterpret_cast<LPARAM>(raw))) delete raw;
         return 0;
-    }, nullptr, 0, nullptr);
-    if (thread) CloseHandle(reinterpret_cast<HANDLE>(thread));
+    }, forceGrok ? reinterpret_cast<void*>(1) : nullptr, 0, nullptr);
+    if (thread) g_refreshThread.reset(reinterpret_cast<HANDLE>(thread));
     else g_refreshRunning = false;
 }
 
@@ -1262,13 +1628,13 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
             // even when the percentage itself has not changed.
             SaveLastPercentage(g_remaining);
         }
-        if (result->grok) {
+        if (result->grokQueried && result->grok) {
             g_grokAvailable = true;
             g_grokSubscriptionRemaining = result->grok->subscriptionRemaining;
             g_grokExpectedRemaining = result->grok->expectedRemaining;
             g_grokResetsAt = result->grok->resetsAt;
             g_grokExtraCreditsCents = result->grok->extraCreditsCents;
-        } else {
+        } else if (result->grokQueried) {
             g_grokAvailable = false;
             g_grokExpectedRemaining = -1;
             g_grokResetsAt.reset();
@@ -1295,12 +1661,13 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
-        case kMenuRefresh: BeginRefresh(); break;
+        case kMenuRefresh: BeginRefresh(true); break;
         case kMenuOpenCodex: OpenCodex(); break;
         case kMenuExit: DestroyWindow(window); break;
         }
         return 0;
     case WM_DESTROY: {
+        g_shuttingDown = true;
         KillTimer(window, kRefreshTimer);
         NOTIFYICONDATAW data{};
         data.cbSize = sizeof(data); data.hWnd = window; data.uID = kTrayId;
@@ -1356,6 +1723,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    if (g_refreshThread) WaitForSingleObject(g_refreshThread.get(), INFINITE);
     GdiplusShutdown(g_gdiplusToken);
     return static_cast<int>(message.wParam);
 }
