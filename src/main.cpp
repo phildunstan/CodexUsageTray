@@ -1482,13 +1482,7 @@ std::wstring TooltipText() {
             text += L" - " + reset;
         }
     }
-    text += L"\r\nGrok 7d: ";
-    if (g_grokAvailable && g_grokSubscriptionRemaining) {
-        text += std::to_wstring(*g_grokSubscriptionRemaining) + L"%";
-    } else {
-        text += L"n/a";
-    }
-    text += L"\r\nxAI free: ";
+    text += L"\r\nxAI credits: ";
     if (!g_xaiApiConfigured) {
         text += L"not set";
     } else if (g_xaiApiAvailable && g_xaiApiFreeCreditsCents) {
